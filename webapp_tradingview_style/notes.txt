@@ -1,0 +1,673 @@
+Setups:
+ 
+.gitignore  venv/
+conda create -p venv python ==3.10
+conda active venv/
+create requirements.txt
+CMD: template.py
+python.exe -m pip install --upgrade pip
+pip install -r requirements.txt
+
+1. Project structure and files
+
+Use this layout in VS Code (Git‑ready and Docker‑friendly):
+
+text
+tradingview_super_chart/
+  app/
+    __init__.py
+    config.py
+    main_fastapi.py
+    main_streamlit.py
+    main_dash.py
+    core/
+      __init__.py
+      data.py
+      ta.py
+    charts/
+      __init__.py
+      lightweight.py
+      plotly_charts.py
+  data/
+    sample_ohlcv.csv
+  docker/
+    Dockerfile.fastapi
+    Dockerfile.streamlit
+    Dockerfile.dash
+  requirements.txt
+  docker-compose.yml
+  .env
+  README.md
+
+You will:
+
+    Put data ingestion + EMA calculations into core/.
+
+    Put chart engines (lightweight‑charts, Plotly) into charts/.
+
+    Put web frontends (FastAPI, Streamlit, Dash) into main_*.py.
+
+2. Core data layer (CSV + API key ingestion)
+2.1 requirements.txt
+
+text
+fastapi
+uvicorn[standard]
+pydantic
+pandas
+requests
+python-dotenv
+lightweight-charts
+plotly
+dash
+dash-bootstrap-components
+streamlit
+bokeh
+
+lightweight-charts is the Python wrapper that exposes from lightweight_charts import Chart.
+2.2 .env
+
+text
+DATA_API_KEY=your_api_key_here
+DATA_API_BASE=https://api.yourbroker.com
+
+2.3 app/core/data.py
+
+Handles:
+
+    CSV ingestion.
+
+    OHLCV from external API with key.
+
+python
+import os
+from typing import Literal, Optional
+
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+API_KEY = os.getenv("DATA_API_KEY", "")
+API_BASE = os.getenv("DATA_API_BASE", "")
+
+Timeframe = Literal["1m", "5m", "15m", "1h", "1d"]
+
+
+def load_csv_ohlcv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    # Expect columns: time, open, high, low, close, volume
+    df["time"] = pd.to_datetime(df["time"])
+    df = df.sort_values("time")
+    return df[["time", "open", "high", "low", "close", "volume"]]
+
+
+def fetch_api_ohlcv(
+    symbol: str,
+    timeframe: Timeframe = "1h",
+    limit: int = 500,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> pd.DataFrame:
+    headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+    params = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "limit": limit,
+    }
+    if start:
+        params["start"] = start
+    if end:
+        params["end"] = end
+
+    url = f"{API_BASE}/ohlcv"
+    r = requests.get(url, headers=headers, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+
+    # Example JSON -> DataFrame; adapt keys to your provider.
+    df = pd.DataFrame(
+        data,
+        columns=["time", "open", "high", "low", "close", "volume"],
+    )
+    df["time"] = pd.to_datetime(df["time"])
+    df = df.sort_values("time")
+    return df
+
+This pattern matches common OHLCV APIs (CoinAPI, exchange REST) where you pass key in header and receive OHLCV arrays.
+3. Technical indicators (EMAs with overlays)
+3.1 app/core/ta.py
+
+python
+import pandas as pd
+
+EMA_PERIODS = [10, 21, 50, 150]
+
+
+def add_emas(df: pd.DataFrame, periods=EMA_PERIODS) -> pd.DataFrame:
+    out = df.copy()
+    for p in periods:
+        out[f"ema_{p}"] = out["close"].ewm(span=p, adjust=False).mean()
+    return out
+
+You will later choose which EMAs to plot or hide via UI toggles.
+4. Lightweight‑charts engine (TradingView‑style)
+
+The Python wrapper can render TradingView Lightweight Charts in a browser, Jupyter, or Streamlit.
+4.1 app/charts/lightweight.py
+
+python
+from typing import List
+
+import pandas as pd
+from lightweight_charts import Chart
+
+from app.core.ta import EMA_PERIODS
+
+
+def build_lightweight_chart(
+    df: pd.DataFrame,
+    emas_enabled: List[int] | None = None,
+    volume: bool = True,
+    toolbox: bool = True,
+) -> Chart:
+    emas_enabled = emas_enabled or EMA_PERIODS
+
+    chart = Chart(
+        width=1200,
+        height=700,
+        title="Super Volume Chart",
+        toolbox=toolbox,       # toolbar with zoom/pan, screenshot, etc.
+    )
+
+    # Main candlestick series
+    candle = chart.add_candlestick_series()
+    candle.set(df[["time", "open", "high", "low", "close"]])
+
+    # Volume series
+    if volume:
+        vol = chart.add_histogram_series(
+            price_format={"type": "volume"},
+            price_scale_id="volume",
+            overlay=True,
+        )
+        vol.set(df[["time", "volume"]])
+
+    # EMAs as overlay lines
+    for p in EMA_PERIODS:
+        if p not in emas_enabled:
+            continue
+        ema_col = f"ema_{p}"
+        if ema_col not in df.columns:
+            continue
+        ema_series = chart.add_line_series(
+            line_width=2,
+            title=f"EMA {p}",
+        )
+        ema_data = df[["time", ema_col]].rename(columns={ema_col: "value"})
+        ema_series.set(ema_data)
+
+    # Enable crosshair + interaction
+    chart.crosshair(mode="normal")
+    chart.legend(visible=True)
+    chart.time_scale(border_visible=True)
+
+    return chart
+
+This uses the library’s Chart object and sets candlestick, volume histogram, and EMA overlays.
+5. Plotly engine (for Dash / richer controls)
+5.1 app/charts/plotly_charts.py
+
+python
+from typing import List
+
+import pandas as pd
+import plotly.graph_objects as go
+
+from app.core.ta import EMA_PERIODS
+
+
+def build_plotly_super_chart(
+    df: pd.DataFrame,
+    emas_enabled: List[int] | None = None,
+) -> go.Figure:
+    emas_enabled = emas_enabled or EMA_PERIODS
+
+    fig = go.Figure()
+
+    # Candlesticks
+    fig.add_trace(
+        go.Candlestick(
+            x=df["time"],
+            open=df["open"],
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            name="Price",
+        )
+    )
+
+    # EMAs
+    for p in EMA_PERIODS:
+        if p not in emas_enabled:
+            continue
+        ema_col = f"ema_{p}"
+        if ema_col not in df.columns:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=df["time"],
+                y=df[ema_col],
+                mode="lines",
+                name=f"EMA {p}",
+            )
+        )
+
+    # Volume bars on secondary axis
+    fig.add_trace(
+        go.Bar(
+            x=df["time"],
+            y=df["volume"],
+            name="Volume",
+            marker_color="rgba(150,150,150,0.4)",
+            yaxis="y2",
+        )
+    )
+
+    fig.update_layout(
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+        yaxis=dict(title="Price"),
+        yaxis2=dict(
+            title="Volume",
+            overlaying="y",
+            side="right",
+            showgrid=False,
+        ),
+        template="plotly_dark",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+
+    return fig
+
+Plotly automatically gives zoom, pan, hover, and a crosshair via hovermode.
+6. FastAPI backend + lightweight‑charts frontend
+
+This version exposes:
+
+    /api/ohlcv JSON (from CSV or external API).
+
+    /chart HTML page embedding the lightweight chart.
+
+6.1 app/config.py
+
+python
+from pydantic import BaseSettings
+
+
+class Settings(BaseSettings):
+    data_source: str = "csv"        # csv or api
+    csv_path: str = "data/sample_ohlcv.csv"
+    default_symbol: str = "BTCUSDT"
+    default_timeframe: str = "1h"
+
+    class Config:
+        env_file = ".env"
+
+
+settings = Settings()
+
+6.2 app/main_fastapi.py
+
+python
+from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse, JSONResponse
+
+from app.config import settings
+from app.core.data import fetch_api_ohlcv, load_csv_ohlcv
+from app.core.ta import add_emas
+from app.charts.lightweight import build_lightweight_chart
+
+app = FastAPI(title="TradingView Super Chart API")
+
+
+def get_df(symbol: str, timeframe: str):
+    if settings.data_source == "csv":
+        df = load_csv_ohlcv(settings.csv_path)
+    else:
+        df = fetch_api_ohlcv(symbol=symbol, timeframe=timeframe)  # uses API key
+    return add_emas(df)
+
+
+@app.get("/api/ohlcv")
+def api_ohlcv(
+    symbol: str = Query(settings.default_symbol),
+    timeframe: str = Query(settings.default_timeframe),
+):
+    df = get_df(symbol, timeframe)
+    return JSONResponse(df.to_dict(orient="records"))
+
+
+@app.get("/chart", response_class=HTMLResponse)
+def chart_page(
+    symbol: str = Query(settings.default_symbol),
+    timeframe: str = Query(settings.default_timeframe),
+    ema_10: bool = True,
+    ema_21: bool = True,
+    ema_50: bool = True,
+    ema_150: bool = True,
+):
+    df = get_df(symbol, timeframe)
+    emas_enabled = []
+    if ema_10:
+        emas_enabled.append(10)
+    if ema_21:
+        emas_enabled.append(21)
+    if ema_50:
+        emas_enabled.append(50)
+    if ema_150:
+        emas_enabled.append(150)
+
+    chart = build_lightweight_chart(df, emas_enabled=emas_enabled)
+    html = chart.render(template="simple")  # returns HTML string with embedded JS
+    return HTMLResponse(content=html)
+
+Run:
+
+bash
+uvicorn app.main_fastapi:app --reload
+
+You now have a browser app with TradingView‑style chart, volume, EMAs, crosshair, and zoom/pan via lightweight‑charts.
+7. Streamlit app (Plotly + lightweight‑charts)
+7.1 app/main_streamlit.py
+
+python
+import streamlit as st
+
+from app.config import settings
+from app.core.data import load_csv_ohlcv, fetch_api_ohlcv
+from app.core.ta import add_emas
+from app.charts.plotly_charts import build_plotly_super_chart
+
+# Optionally: from lightweight_charts import StreamlitChart (if your wrapper exposes it)
+
+
+def get_df(source: str, symbol: str, timeframe: str):
+    if source == "CSV":
+        df = load_csv_ohlcv(settings.csv_path)
+    else:
+        df = fetch_api_ohlcv(symbol=symbol, timeframe=timeframe)
+    return add_emas(df)
+
+
+def main():
+    st.set_page_config(page_title="Super Volume Chart", layout="wide")
+
+    st.sidebar.header("Data")
+    source = st.sidebar.selectbox("Source", ["CSV", "API"])
+    symbol = st.sidebar.text_input("Symbol", value=settings.default_symbol)
+    timeframe = st.sidebar.selectbox("Timeframe", ["1m", "5m", "15m", "1h", "1d"])
+
+    st.sidebar.header("Overlays")
+    ema_10 = st.sidebar.checkbox("EMA 10", value=True)
+    ema_21 = st.sidebar.checkbox("EMA 21", value=True)
+    ema_50 = st.sidebar.checkbox("EMA 50", value=True)
+    ema_150 = st.sidebar.checkbox("EMA 150", value=True)
+
+    emas_enabled = [
+        p
+        for p, enabled in zip(
+            [10, 21, 50, 150],
+            [ema_10, ema_21, ema_50, ema_150],
+        )
+        if enabled
+    ]
+
+    df = get_df(source, symbol, timeframe)
+
+    st.title("TradingView‑style Super Volume Chart")
+
+    fig = build_plotly_super_chart(df, emas_enabled=emas_enabled)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Example: show data preview and allow custom CSV upload
+    st.sidebar.header("Custom CSV")
+    csv_file = st.sidebar.file_uploader("Upload OHLCV CSV", type=["csv"])
+    if csv_file is not None:
+        custom_df = load_csv_ohlcv(csv_file)
+        custom_df = add_emas(custom_df)
+        fig2 = build_plotly_super_chart(custom_df, emas_enabled=emas_enabled)
+        st.subheader("Custom CSV Chart")
+        st.plotly_chart(fig2, use_container_width=True)
+
+
+if __name__ == "__main__":
+    main()
+
+st.plotly_chart gives zoom, pan, hover, and crosshair‑like unified hover.​
+
+Run:
+
+bash
+streamlit run app/main_streamlit.py
+
+8. Dash app (Plotly + full controls)
+8.1 app/main_dash.py
+
+python
+from dash import Dash, dcc, html, Input, Output
+import dash_bootstrap_components as dbc
+
+from app.config import settings
+from app.core.data import load_csv_ohlcv, fetch_api_ohlcv
+from app.core.ta import add_emas
+from app.charts.plotly_charts import build_plotly_super_chart
+
+app = Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.DARKLY],
+    title="Super Volume Chart",
+)
+server = app.server
+
+
+def get_df(source: str, symbol: str, timeframe: str):
+    if source == "CSV":
+        df = load_csv_ohlcv(settings.csv_path)
+    else:
+        df = fetch_api_ohlcv(symbol=symbol, timeframe=timeframe)
+    return add_emas(df)
+
+
+app.layout = dbc.Container(
+    [
+        html.H2("TradingView Super Volume Chart"),
+        dbc.Row(
+            [
+                dbc.Col(
+                    [
+                        dbc.Label("Source"),
+                        dcc.Dropdown(
+                            id="source",
+                            options=[
+                                {"label": "CSV", "value": "CSV"},
+                                {"label": "API", "value": "API"},
+                            ],
+                            value="CSV",
+                        ),
+                        dbc.Label("Symbol"),
+                        dcc.Input(
+                            id="symbol",
+                            type="text",
+                            value=settings.default_symbol,
+                        ),
+                        dbc.Label("Timeframe"),
+                        dcc.Dropdown(
+                            id="timeframe",
+                            options=[
+                                {"label": tf, "value": tf}
+                                for tf in ["1m", "5m", "15m", "1h", "1d"]
+                            ],
+                            value=settings.default_timeframe,
+                        ),
+                        dbc.Label("EMAs"),
+                        dbc.Checklist(
+                            id="emas",
+                            options=[
+                                {"label": "EMA 10", "value": 10},
+                                {"label": "EMA 21", "value": 21},
+                                {"label": "EMA 50", "value": 50},
+                                {"label": "EMA 150", "value": 150},
+                            ],
+                            value=[10, 21, 50, 150],
+                            inline=True,
+                        ),
+                    ],
+                    md=3,
+                ),
+                dbc.Col(
+                    dcc.Graph(id="super-chart", style={"height": "80vh"}),
+                    md=9,
+                ),
+            ]
+        ),
+    ],
+    fluid=True,
+)
+
+
+@app.callback(
+    Output("super-chart", "figure"),
+    Input("source", "value"),
+    Input("symbol", "value"),
+    Input("timeframe", "value"),
+    Input("emas", "value"),
+)
+def update_chart(source, symbol, timeframe, emas_enabled):
+    df = get_df(source, symbol, timeframe)
+    fig = build_plotly_super_chart(df, emas_enabled=emas_enabled)
+    return fig
+
+
+if __name__ == "__main__":
+    app.run_server(debug=True, host="0.0.0.0", port=8050)
+
+Dash adds UI and dynamic updates on symbol/timeframe/EMA settings.​
+9. Docker + docker‑compose + AWS EC2/S3 notes
+9.1 docker/Dockerfile.fastapi
+
+text
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENV PYTHONPATH=/app
+
+CMD ["uvicorn", "app.main_fastapi:app", "--host", "0.0.0.0", "--port", "8000"]
+
+9.2 docker/Dockerfile.streamlit
+
+text
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENV PYTHONPATH=/app
+
+CMD ["streamlit", "run", "app/main_streamlit.py", "--server.port=8501", "--server.address=0.0.0.0"]
+
+9.3 docker/Dockerfile.dash
+
+text
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENV PYTHONPATH=/app
+
+CMD ["python", "app/main_dash.py"]
+
+9.4 docker-compose.yml
+
+text
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.fastapi
+    ports:
+      - "8000:8000"
+    env_file: .env
+
+  streamlit:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.streamlit
+    ports:
+      - "8501:8501"
+    env_file: .env
+
+  dash:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dash
+    ports:
+      - "8050:8050"
+    env_file: .env
+
+Run all:
+
+bash
+docker-compose up --build
+
+For AWS EC2, you can:
+
+    Push this repo to GitHub, clone on EC2, install Docker, run docker-compose up -d and open security group ports 8000/8050/8501.​
+
+    Store CSVs on S3 by changing settings.csv_path to an S3 download step (e.g., boto3 download to local path before load_csv_ohlcv).
+
+10. GitHub and documentation checklist
+
+In README.md, document:
+
+    Project overview (FastAPI + lightweight‑charts, Streamlit, Dash).
+
+    How to:
+
+        Set .env and API keys.
+
+        Add custom CSVs under data/.
+
+        Run each app locally.
+
+        Build and run Docker images.
+
+        Deploy to EC2 (pull from GitHub, run Docker).
+
+    Explain architecture:
+
+        Core data layer: app/core/data.py, app/core/ta.py.
+
+        Chart engines: app/charts/lightweight.py, app/charts/plotly_charts.py.
+
+        Web frontends: main_fastapi.py, main_streamlit.py, main_dash.py.
+
+If you tell me which frontend you want to finish first (FastAPI + lightweight‑charts, Streamlit, or Dash), I can refine that part into a copy‑paste runnable minimal example including a sample sample_ohlcv.csv schema and Git commands to initialize the repo.

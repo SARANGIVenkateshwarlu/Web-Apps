@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic
+pandas
+requests
+python-dotenv
+lightweight-charts
+plotly
+dash
+dash-bootstrap-components
+streamlit
+bokeh
