@@ -1,12 +1,16 @@
 Setups:
  
-.gitignore  venv/
+.gitignore   ---> .venv
 conda create -p venv python ==3.10
 conda active venv/
 create requirements.txt
 CMD: template.py
 python.exe -m pip install --upgrade pip
 pip install -r requirements.txt
+.............
+git status
+
+
 
 1. Project structure and files
 
